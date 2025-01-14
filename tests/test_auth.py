@@ -1,8 +1,10 @@
 """Tests for the tools to communicate with the cloud."""
+
 import asyncio
 from unittest.mock import MagicMock, patch
 
 from botocore.exceptions import ClientError
+from pycognito.exceptions import MFAChallengeException
 import pytest
 
 from hass_nabucasa import auth as auth_api
@@ -54,6 +56,47 @@ async def test_login_user_not_confirmed(mock_cognito, mock_cloud):
     assert len(mock_cloud.update_token.mock_calls) == 0
 
 
+async def test_login_user_mfa_required(mock_cognito, mock_cloud):
+    """Test trying to login without MFA when it is required."""
+    auth = auth_api.CognitoAuth(mock_cloud)
+    mock_cognito.authenticate.side_effect = MFAChallengeException("MFA required", {})
+
+    with pytest.raises(auth_api.MFARequired):
+        await auth.async_login("user", "pass")
+
+    assert len(mock_cloud.update_token.mock_calls) == 0
+
+
+async def test_login_user_verify_totp_invalid_code(mock_cognito, mock_cloud):
+    """Test trying to login with MFA when it is required."""
+    auth = auth_api.CognitoAuth(mock_cloud)
+    mock_cognito.respond_to_software_token_mfa_challenge.side_effect = aws_error(
+        "CodeMismatchException",
+    )
+
+    with pytest.raises(auth_api.InvalidTotpCode):
+        await auth.async_login_verify_totp("user", "123456", {"session": "session"})
+
+    assert len(mock_cloud.update_token.mock_calls) == 0
+
+
+async def test_login_user_verify_totp(mock_cognito, mock_cloud):
+    """Test trying to login with MFA when it is required."""
+    auth = auth_api.CognitoAuth(mock_cloud)
+    mock_cognito.id_token = "test_id_token"
+    mock_cognito.access_token = "test_access_token"
+    mock_cognito.refresh_token = "test_refresh_token"
+
+    await auth.async_login_verify_totp("user", "123456", {"session": "session"})
+
+    assert len(mock_cognito.respond_to_software_token_mfa_challenge.mock_calls) == 1
+    mock_cloud.update_token.assert_called_once_with(
+        "test_id_token",
+        "test_access_token",
+        "test_refresh_token",
+    )
+
+
 async def test_login(mock_cognito, mock_cloud):
     """Test trying to login without confirming account."""
     auth = auth_api.CognitoAuth(mock_cloud)
@@ -65,7 +108,9 @@ async def test_login(mock_cognito, mock_cloud):
 
     assert len(mock_cognito.authenticate.mock_calls) == 1
     mock_cloud.update_token.assert_called_once_with(
-        "test_id_token", "test_access_token", "test_refresh_token"
+        "test_id_token",
+        "test_access_token",
+        "test_refresh_token",
     )
 
 
@@ -73,7 +118,9 @@ async def test_register(mock_cognito, cloud_mock):
     """Test registering an account."""
     auth = auth_api.CognitoAuth(cloud_mock)
     await auth.async_register(
-        "email@home-assistant.io", "password", client_metadata={"test": "metadata"}
+        "email@home-assistant.io",
+        "password",
+        client_metadata={"test": "metadata"},
     )
     assert len(mock_cognito.register.mock_calls) == 1
 
@@ -82,6 +129,17 @@ async def test_register(mock_cognito, cloud_mock):
     assert result_user == "email@home-assistant.io"
     assert result_password == "password"
     assert call.kwargs["client_metadata"] == {"test": "metadata"}
+
+
+async def test_register_lowercase_email(mock_cognito, cloud_mock):
+    """Test forcing lowercase email when registering an account."""
+    auth = auth_api.CognitoAuth(cloud_mock)
+    await auth.async_register("EMAIL@HOME-ASSISTANT.IO", "password")
+    assert len(mock_cognito.register.mock_calls) == 1
+
+    call = mock_cognito.register.mock_calls[0]
+    result_user = call.args[0]
+    assert result_user == "email@home-assistant.io"
 
 
 async def test_register_fails(mock_cognito, cloud_mock):
@@ -171,9 +229,10 @@ async def test_async_setup(cloud_mock):
     on_connect = cloud_mock.iot.mock_calls[0][1][0]
     on_disconnect = cloud_mock.iot.mock_calls[1][1][0]
 
-    with patch("random.randint", return_value=0), patch(
-        "hass_nabucasa.auth.CognitoAuth.async_renew_access_token"
-    ) as mock_renew:
+    with (
+        patch("random.randint", return_value=0),
+        patch("hass_nabucasa.auth.CognitoAuth.async_renew_access_token") as mock_renew,
+    ):
         await on_connect()
         # Let handle token sleep once
         await asyncio.sleep(0)
@@ -190,10 +249,15 @@ async def test_async_setup(cloud_mock):
         assert len(mock_renew.mock_calls) == 1
 
 
-async def test_guard_no_login_authenticated_cognito():
+@pytest.mark.parametrize(
+    "auth_mock_kwargs",
+    (
+        {"access_token": None},
+        {"refresh_token": None},
+    ),
+)
+async def test_guard_no_login_authenticated_cognito(auth_mock_kwargs: dict[str, None]):
     """Test that not authenticated cognito login raises."""
+    auth = auth_api.CognitoAuth(MagicMock(**auth_mock_kwargs))
     with pytest.raises(auth_api.Unauthenticated):
-        auth_api.CognitoAuth(MagicMock(access_token=None))._authenticated_cognito
-
-    with pytest.raises(auth_api.Unauthenticated):
-        auth_api.CognitoAuth(MagicMock(refresh_token=None))._authenticated_cognito
+        await auth._async_authenticated_cognito()
